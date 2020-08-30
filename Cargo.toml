@@ -1,0 +1,19 @@
+[package]
+name = "sv_challenge"
+version = "0.1.0"
+authors = ["gwierzchowski <gwierzchowski@wp.pl>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+# Algorithm is checked at runtime using state function based on f64 or bigdec; 
+state_fun_f64 = []
+state_fun_bd = ["bigdecimal"]
+
+[dependencies]
+anyhow = "1"
+bigdecimal = { version = "0.1", optional = true }
+
+[dev-dependencies]
+rand = "0.7.3"
