@@ -1,26 +1,22 @@
 /*!
  * Solve problem using manually written simulation working in main thread.  
- * Version 1: Points evaluated in entry data order
+ * Version 2: Points evaluated from highest ground to lowest, performs calculation on BigDecimal.
  */
+
+use std::iter::FromIterator;
 
 use anyhow::Result;
 
-#[cfg(feature = "state_fun_bd")]
-#[allow(unused_imports)]
 use bigdecimal::{BigDecimal, Zero};
 
 // use crate::PointHeight;
 /// Base unclehood type used for calculations during simulation in this module.
 type PointHeight = <Landscape as crate::Solver>::PointHeight;
 
-/// Default precision to perform calculations.
-const VISCOSITY_COEF: PointHeight = 0.01;
-
-// TODO: Point1D could be made a template parameter, with some generic trait implementation.
-// The same algorithm may work for other topologies (e.g. Point2D, generic Point with its own list of neighbors, etc.`)
 /// Represents entire 'world' where water is raining onto and flowing down from point (section in the paper) to point.
 pub struct Landscape {
     points: Vec<Point>,
+    points_idx: Vec<usize>,
     results: Vec<PointHeight>,
     precision: PointHeight,
 }
@@ -47,7 +43,10 @@ impl Landscape {
         for h in &ph {
             points.push(Point::with_height((*h).into()));
         }
-        Landscape { points, results:ph, precision:VISCOSITY_COEF }
+        let mut points_idx = Vec::from_iter((0..ph.len()).into_iter());
+        points_idx.sort_unstable_by(|i, j| ph[*j].partial_cmp(&ph[*i]).unwrap());
+        let results = Vec::from_iter(ph.into_iter().map(|h| h.into()));
+        Landscape { points, points_idx, results, precision:BigDecimal::from(0.01) }
     }
 
     /// Create Landscape object.
@@ -74,37 +73,38 @@ impl Landscape {
         let (state_lbound, mut state) = (self.calc_state_lbound(), self.calc_state());
 
         let mut send_water_to = Vec::new(); // TODO: possibly use smallvec or tiny_vec
+        let mut water_update = Vec::new();
         loop {
-            let mut water_update = Vec::new();
-            for pi in 0..self.points.len() {
-                let pw = self.points[pi].water;
+            water_update.clear();
+            for pi in &self.points_idx {
+                let pw = self.points[*pi].water.clone();
                 if pw <= self.precision {
                     continue;
                 }
                 send_water_to.clear(); 
-                let ph = self.points[pi].get_height();
-                for ni in self.neighbors(pi) {
+                let ph = self.points[*pi].get_height();
+                for ni in self.neighbors(*pi) {
                     let nh = self.points[ni].get_height();
-                    if ph > nh + self.precision {
+                    if ph > nh + &self.precision {
                         send_water_to.push(ni);
                     }
                 }
                 if send_water_to.is_empty() {
                     continue;
                 }
-                let equal_fraction = pw / send_water_to.len() as PointHeight;
+                let equal_fraction = pw / BigDecimal::from(send_water_to.len() as f64);
                 for ni in &send_water_to {
-                    let diff = self.points[pi].get_height() - self.points[*ni].get_height();
+                    let diff = self.points[*pi].get_height() - self.points[*ni].get_height();
                     if diff > self.precision {
-                        let flow_amt = if equal_fraction < diff / 2.0 { equal_fraction } else { diff / 2.0 };
+                        let flow_amt = if equal_fraction < diff.half() { equal_fraction.clone() } else { diff.half() };
                         water_update.push(
                             WaterUpdate {
-                                from_idx: pi,
+                                from_idx: *pi,
                                 to_idx: *ni,
                                 water: flow_amt,
                                 
                                 #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
-                                from: self.points[pi].clone(),
+                                from: self.points[*pi].clone(),
                                 #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
                                 to: self.points[*ni].clone(),
                             }
@@ -116,8 +116,8 @@ impl Landscape {
                 break;
             }
             for wu in &mut water_update {
-                self.points[wu.from_idx].water -= wu.water;
-                self.points[wu.to_idx].water += wu.water;
+                self.points[wu.from_idx].water -= wu.water.clone();
+                self.points[wu.to_idx].water += wu.water.clone();
             }
             
             #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))] {
@@ -186,10 +186,13 @@ impl Landscape {
         lbound        
     }
 }
+// impl Copy for BigDecimal {
+
+// }
 
 impl crate::Solver for Landscape {
     /// Base unclehood type used for calculations during simulation in this module.
-    type PointHeight = f64; 
+    type PointHeight = BigDecimal; 
     
     /// Simulates one step of falling rain.
     fn rain(&mut self, rain_distr: impl Fn(usize) -> PointHeight, return_result: bool) -> Result<&[PointHeight]> {
@@ -210,7 +213,7 @@ impl crate::Solver for Landscape {
     }
     
     /// Returns simulation precision.
-    fn precision(&self) -> PointHeight { self.precision }
+    fn precision(&self) -> PointHeight { self.precision.clone() }
 }
 
 /// Represents point (section) on landscape
@@ -226,14 +229,14 @@ impl Point {
     fn with_height(h: PointHeight) -> Self {
         Point { 
             ground: h,
-            water: 0.0,
+            water: Zero::zero(),
         }
     }
 
     /// Returns level of water (dry point height + water over it)
     #[inline]
     fn get_height(&self) -> PointHeight {
-        self.ground + self.water
+        self.ground.clone() + &self.water
     }
     
     /// Simulate `cnt` amount of water raining on point
@@ -271,7 +274,6 @@ impl Iterator for Iter1D {
 #[derive(Debug, Clone)]
 struct PointFreehand {
     ground: PointHeight,
-    water: PointHeight,
     neighbors: Vec<usize>,
 }
 
@@ -279,27 +281,20 @@ impl PointFreehand {
     fn with_height(h: PointHeight) -> Self {
         PointFreehand { 
             ground: h,
-            water: 0.0,
             neighbors: Vec::with_capacity(2) 
         }
-    }
-
-    #[inline]
-    fn get_height(&self) -> PointHeight {
-        self.ground + self.water
     }
     
     #[inline]
     fn add_neighbor(&mut self, other: usize) {
         self.neighbors.push(other);
     }
-    
-    #[inline]
-    fn rain(&mut self, cnt: PointHeight) {
-        self.water += cnt;
-    }
 }
 */
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+/// Tests
+/// 
 
 #[cfg(test)]
 mod tests {
@@ -307,5 +302,79 @@ mod tests {
     use super::super::*;
     const STRICT_EQUALITY:bool = false;
 
-    include!("test_common_f64.inc.rs");
+    fn compare(precision:&PointHeight, left: &[PointHeight], right: &[PointHeight]) {
+        assert_eq!(left.len(), right.len());
+        if precision.partial_cmp(&Zero::zero()) == Some(std::cmp::Ordering::Equal) || STRICT_EQUALITY {
+            assert_eq!(left, right);
+        } else {
+            // let mut diff = Zero::zero();
+            for (i, _r) in left.iter().enumerate() {
+                if (left[i].clone() - &right[i]).abs() > precision.clone() * BigDecimal::from(left.len() as f64) {
+                    assert!(false, "left[{}]={} != right[{}]={}", i, left[i], i, right[i]);
+                }
+                // if (left[i] - right[i]).abs() > prec {
+                //     assert!(false, "left[{}]={} != right[{}]={}", i, left[i], i, right[i]);
+                // }
+                // diff += (left[i] - right[i]).abs();
+                // if diff > prec * (left.len() as PointHeight) {
+                //     assert!(false, "left={:?} != right={:?}; diff={}", left, right, diff);
+                // }
+            }
+        }
+    }
+
+    #[test]
+    fn sv_case_sample() {
+        let points = vec![3.0, 1.0, 6.0, 4.0, 8.0, 9.0];
+        let mut landscape = Landscape::create(points);
+        let prec = landscape.precision();
+        let result = landscape.rain_uniform(RAIN_DENSITY.into(), true).unwrap();
+        compare(&prec, result, [4.0, 4.0, 6.0, 6.0, 8.0, 9.0]
+            .iter().map(|h| BigDecimal::from(*h)).collect::<Vec<BigDecimal>>().as_slice()
+        );
+    }
+
+    #[test]
+    fn sv_case_mail2() {
+        let points = vec![8.0, 8.0, 1.0];
+        let mut landscape = Landscape::create(points);
+        let prec = landscape.precision();
+        let result = landscape.rain_uniform(RAIN_DENSITY.into(), true).unwrap();
+        compare(&prec, result, [8.0, 8.0, 4.0]
+            .iter().map(|h| BigDecimal::from(*h)).collect::<Vec<BigDecimal>>().as_slice()
+        );
+    }
+
+    #[test]
+    fn sv_case_mail3() {
+        let points = vec![1.0, 8.0, 8.0, 1.0];
+        let mut landscape = Landscape::create(points);
+        let prec = landscape.precision();
+        let result = landscape.rain_uniform(RAIN_DENSITY.into(), true).unwrap();
+        compare(&prec, result, [3.0, 8.0, 8.0, 3.0]
+            .iter().map(|h| BigDecimal::from(*h)).collect::<Vec<BigDecimal>>().as_slice()
+        );
+    }
+
+    #[test]
+    fn sv_case_mail4() {
+        let points = vec![8.0, 4.0, 8.0, 8.0, 1.0];
+        let mut landscape = Landscape::create(points);
+        let prec = landscape.precision();
+        let result = landscape.rain_uniform(RAIN_DENSITY.into(), true).unwrap();
+        compare(&prec, result, [8.0, 7.0, 8.0, 8.0, 3.0]
+            .iter().map(|h| BigDecimal::from(*h)).collect::<Vec<BigDecimal>>().as_slice()
+        );
+    }
+
+    #[test]
+    fn sv_case_mail5() {
+        let points = vec![1.0, 8.0, 8.0, 8.0, 1.0];
+        let mut landscape = Landscape::create(points);
+        let prec = landscape.precision();
+        let result = landscape.rain_uniform(RAIN_DENSITY.into(), true).unwrap();
+        compare(&prec, result, [3.5, 8.0, 8.0, 8.0, 3.5]
+            .iter().map(|h| BigDecimal::from(*h)).collect::<Vec<BigDecimal>>().as_slice()
+        );
+    }
 }

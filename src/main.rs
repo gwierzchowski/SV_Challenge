@@ -21,24 +21,18 @@ use std::io::{stdin, stdout, Write};
 
 use anyhow::Result;
 
-/// Type that represents point height and water height.
-/// Basic unclehood type used for calculations during simulation.
-type PointHeight = f64; 
-// TODO: This is not right design. Concrete type should be defined inside simulation engine, for API purposes some abstraction (aka Pattern in std::) should be used
-// NOTE: Not sure of anything other than f64 makes sense here:
-//       f32 causes calc_state() checks failures (but may work if memory usage is a big concern)
-//       BigDecimal or BigRational would cause huge performance degradation
-
 /// Amount of rain that falls onto one point (segment) in one step (1h).
-const RAIN_DENSITY: PointHeight = 1.0;
+const RAIN_DENSITY: f64 = 1.0;
 
 mod simul_manual_1th_v1;
 mod simul_manual_1th_v2;
-// mod simul_actors;
+#[cfg(feature = "bigdecimal")]
+mod simul_manual_1th_bd_v2;
+// mod simul_manual_1th_v3;
 
 
 /// Creates concrete object used to solve problem.
-fn solver_factory(points_heights: Vec<PointHeight>) -> impl Solver {
+fn solver_factory(points_heights: Vec<f64>) -> impl Solver {
     // simul_manual_1th_v1::Landscape::create(points_heights)
     simul_manual_1th_v2::Landscape::create(points_heights)
 }
@@ -67,7 +61,7 @@ where:
     loop {
         match stdin.read_line(&mut buf) {
             Ok(n) if n > 1 => {
-                match buf.trim().parse::<PointHeight>() {
+                match buf.trim().parse::<f64>() {
                     Ok(p) => {
                         // TODO: Maybe negative is ok - check after algorithm is ready
                         // Note: Algorithm should be ok, but negative numbers may mess-up calc_state()
@@ -86,9 +80,11 @@ where:
     let mut stdout = stdout();
     let mut landscape = solver_factory(points);
     for n in 1..=steps {
-        match landscape.rain_uniform(RAIN_DENSITY, true) {
+        match landscape.rain_uniform(RAIN_DENSITY.into(), true) {
             Ok(water_levels) => {
-                stdout.write_all(format!("{:?}", water_levels).trim_matches(&['[',']'] as &[_]).as_bytes())?;
+                // TODO: it should be rather format!("{}", ...
+                // TODO: this may not be good, it should be reworked using IntoStr
+                stdout.write_all(format!("{:?}", water_levels).trim_matches(&['[',']'] as &[_]).as_bytes())?; 
                 stdout.write(&[b'\n'])?;
             },
             Err(e) => { bail!("Error during {} st/th invocation of rain(): {}", n, e); }
@@ -99,13 +95,22 @@ where:
 
 /// Functions required to solve problem.
 pub trait Solver {
+    /// Type that represents point height and water height.
+    /// Base unclehood type used for calculations during simulation.
+    type PointHeight: std::fmt::Debug + From<f64> + Clone; //TODO: It should be rather Display
+
     /// Simulates one step (1h in problem description) of falling rain.  
     /// `rain_distr` - function which determines rain density (amount of water) depending on point index.  
     /// `return_result` - weather function should return result (water levels) or just simulate rain (empty slice is returned)
-    fn rain(&mut self, rain_distr: impl Fn(usize) -> PointHeight, return_result: bool) -> Result<&[PointHeight]>;
+    fn rain(&mut self, rain_distr: impl Fn(usize) -> Self::PointHeight, return_result: bool) -> Result<&[Self::PointHeight]>;
     
     /// Default implementation in case when rain is uniform thru entire landscape (as in problem description = 1.0)
-    fn rain_uniform(&mut self, cnt: PointHeight, return_result: bool) -> Result<&[PointHeight]> {
-        self.rain(|_| cnt, return_result)
+    fn rain_uniform(&mut self, cnt: Self::PointHeight, return_result: bool) -> Result<&[Self::PointHeight]> {
+        self.rain(|_| cnt.clone(), return_result)
     }
+
+    /// Returns simulation precision.
+    /// If water levels difference is less than returned value, water will not flow (0 for exact simulation)
+    fn precision(&self) -> Self::PointHeight;
 }
+

@@ -65,14 +65,15 @@ Program after it read input data and initialize landscape object, calls `rain(..
       + for every dirty neighbor of the point (@@):  
         ~ sets **diff** as difference between current (accounting changes done in previous runs of this loop) 'water level' of point and 'water level' of neighbor  
         ~ if 'diff' is less or equal to zero - continue loop with next dirty neighbor (@@@)  
-        ~ sets **flow_amt** as minimum of half of 'diff' and 'equal_fraction`  
+        ~ sets **flow_amt** as minimum of half of 'diff' and 'equal_fraction'  
+        ~ record this flow event (adds to `water_update` vector) to be done after this internal loop
+      + for every recorded flow event:  
         ~ decrease water in the point by 'flow_amt'  
         ~ increase water in the neighbor by 'flow_amt'  
-        ~ optionally record this flow event for debugging purposes 
     * optionally call `calc_state()` function and check if state value decreased since previous step (check correctness of algorithm).  
 
 #### Implementation detail:  
-Calculations are being done on floating numbers. To mitigate rounding effects and ensure calculations stability all water level comparisons are being done with arbitrary tolerance determined by constant `VISCOSITY_COEF` defined in the program as 0.01.
+Calculations are being done on floating numbers. To mitigate rounding effects and ensure calculations stability all water level comparisons are being done with arbitrary tolerance determined by **precision** set during landscape creation (with default value defined as 0.01).
 
 #### Correctness.  
 A) Steps described in inner loop (@@) does implement rules provided in the task description. Taking 'half of diff' into account guarantee that water flow will stop when levels equalize. Taking 'equal_fraction' into account causes equal ware distribution in case it can flow in several directions. Setting 'flow_amt' as minimum assures that we do not flow-out more water than it is currently in the point (i.e. we do not reach negative water amount). Also note that this loop is the only one place in the program where water flow occurs.
@@ -96,18 +97,28 @@ Respective code:
 // w_p -> points[pi].water
 // w_n -> points[*ni].water
 // f -> flow_amt
-// VISCOSITY_COEF == 0.01
+// self.precision == 0.01
 let equal_fraction = pw / send_water_to.len() as PointHeight;
 for ni in &send_water_to {
     let diff = self.points[pi].get_height() - self.points[*ni].get_height();
-    if diff > VISCOSITY_COEF {
+    if diff > self.precision {
         let flow_amt = if equal_fraction < diff / 2.0 { equal_fraction } else { diff / 2.0 };
-        // ...
-        self.points[pi].water -= flow_amt;
-        self.points[*ni].water += flow_amt;
-        idle = false;
+        water_update.push(
+            WaterUpdate {
+                from_idx: pi,
+                to_idx: *ni,
+                water: flow_amt,
+                // ...
+            }
+        );
     }
 }
+// ...
+for wu in &mut water_update {
+    self.points[wu.from_idx].water -= wu.water;
+    self.points[wu.to_idx].water += wu.water;
+}
+
 ```
 Also from task / input data constraints we know that all $w_\bullet$ values are positive or zero.  
 Assuming we have only one water flow (from $p$ to $n$) in $t+1$ iteration, our state functions are equal:
@@ -123,14 +134,15 @@ $$2(w_n-w_p)f + 2f^2\le$$
 $$-(w_p - w_n)^2 + \frac{(w_p - w_n)^2}{2}=$$
 $$-\frac{(w_p - w_n)^2}{2} < 0$$
 
-So our state function is strictly decreasing in every major loop iteration. It is also bounded from bottom by zero (and the sum similar to state function but using ground levels). So from well known math calculus theorem state function must converge to some limit - what in practice means that water levels are stable, does not change in next iteration and our loop end. To prevent waiting long time for this stabilization, constant `VISCOSITY_COEF` was introduced. Its value can be decreased by programmer, what would increase precision, but decrease performance. It should not be however set to 0.0.
+So our state function is strictly decreasing in every major loop iteration. It is also bounded from bottom by zero (and the sum similar to state function but using ground levels). So from well known math calculus theorem state function must converge to some limit - what in practice means that water levels are stable, does not change in next iteration and our loop end. To prevent waiting long time for this stabilization 'precision' was introduced. Its value can be decreased by programmer, what would increase precision, but degrade performance. It should not be however set to 0.0 because it may cause program to hang.
 
 #### Computational complexity.
-Exact computational complexity is hard to estimate, because it is not obvious how many iterations will be done in highest level loop in water stabilization function. I did not spent too much time on investigation. Maximal possible convexity is $O(N^2)$ and minimal is $O(N)$. Empirical measurements against different random data sets at different sizes shows that it is rather linear $\sim 5N$.
+Exact computational complexity is hard to estimate, because it is not obvious how many iterations will be done in highest level loop in water stabilization function. I did not spent too much time on investigation. Maximal possible convexity is $O(N^2)$ and minimal is $O(N)$. Empirical measurements against different random data sets at different sizes shows that it is rather linear $\sim 5N$.  
+TODO: Measure how performance depends on 'precision'.
 
 #### Variants.
-There are 2 variants of above algorithm, implemented in modules `simul_manual_1th_v1` and `simul_manual_1th_v2`.
-The second one is small improvement of first. The only difference is that in second algorithm points in middle loop are processed in order from higher ones to lower ones unlike the first one where they are processed in data driven order. I counted that this change would cause smaller number of highest level iteration. Measurements against large data showed small performance improvement, but not very big, and second algorithm has some memory penalty for additional vector of $N$ size with indexes.  
+There are 3 variants of above algorithm, implemented in modules `simul_manual_1th_v1`, `simul_manual_1th_v2`and `simul_manual_1th_bd_v2`.
+The second one is small improvement of first. The only difference is that in second algorithm points in middle loop are processed in order from higher ones to lower ones unlike the first one where they are processed in data driven order. I counted that this change would cause smaller number of highest level iteration. Measurements against large data showed small performance improvement, but not very big, and second algorithm has some memory penalty for additional vector of $N$ size with indexes. The third algorithm is identical to second but uses `BigDecimal` instead of `f64`.  
 
 One can switch between two algorithms by emailing respective line in the code near begin of `main.rs` file.
 ```rust
@@ -161,6 +173,7 @@ Each of following two features causes that state function is being calculated at
 |-----------------|---------|-------------|
 | `state_fun_f64` | off | Use state function besed on `f64`  |
 | `state_fun_bd`  | off | Use state function besed on `BigDecimal` (higher precision, but huge performance degradation)  |
+| `bigdecimal   ` | on  | Enables algorithms based on `BigDecimal`  |
 .
 
 #### Utilities
@@ -173,6 +186,17 @@ For example, to generate file with 10k points, invoke:
 cargo run --example sample -- 10000 >data/sample.txt
 ```
 
+Changelog
+---------
+### Version 0.1.0 (Aug 29, 2020)
+- Initial version.
+
+### Version 0.2.0 (Sept 1, 2020)
+- Fixed bug that caused program to produce results that depended on order of visited points (e.g. not simmetric results for simmertic input).
+- Some architectural changes: precision possible ot set during landscape definition, calculation base type moved from main program to modules.
+- Added 3rd implementation that works on `BigDecimal` type.
+- Added few ad-hoc unit tests (not a complete or designed test suite)
+
 Possible improvements
 ---------------------
 The time for exercise was limited (few days), so there is still some room for potential improvements in the future.
@@ -180,6 +204,7 @@ Things that came to my mind are:
 
 - Few thinks noted in the code as `TODO`.
 - Unit and integration tests !!!
+- Alternative single thread algorithm, that would produce exact water levels. E.g. working on BigRational type. Note: it should consider some point groups with equal water level and treat them as an units, the approach `diff / 2.0` will not work e.g. for the case [4,1,1,1].
 - It is possible to introduce some parallelism. 
   * At first `rayon` crate could be used to add water during rain to points and produce results (steps 1 and 3 of `rain` function).
   * Water stabilization function can be I think parallelized in following way. As in 'v2' algorithm we sort points by ground level and at first process first N highest points. Then if after this step some points became out of water, then process all points between those 2 in separate thread.

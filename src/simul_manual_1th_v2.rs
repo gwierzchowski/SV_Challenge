@@ -11,7 +11,9 @@ use anyhow::Result;
 #[allow(unused_imports)]
 use bigdecimal::{BigDecimal, Zero};
 
-use crate::PointHeight;
+// use crate::PointHeight;
+/// Base unclehood type used for calculations during simulation in this module.
+type PointHeight = <Landscape as crate::Solver>::PointHeight;
 
 /// If water level is less than this value water does not flow from point to point.
 /// Note: Placing 0.0 here may cause program to fall into infinite loop because of rounding errors.
@@ -21,19 +23,22 @@ const VISCOSITY_COEF: PointHeight = 0.01;
 // The same algorithm may work for other topologies (e.g. Point2D, generic Point with its own list of neighbors, etc.`)
 /// Represents entire 'world' where water is raining onto and flowing down from point (section in the paper) to point.
 pub struct Landscape {
-    points: Vec<Point1D>,
+    points: Vec<Point>,
     points_idx: Vec<usize>,
     results: Vec<PointHeight>,
+    precision: PointHeight,
 }
 
-#[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
 #[derive(Debug)]
-struct DiagWaterUpdate1D {
-    from: Point1D,
+struct WaterUpdate {
     from_idx: usize,
-    to: Point1D,
     to_idx: usize,
     water: PointHeight,
+
+    #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
+    from: Point,
+    #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
+    to: Point,
 }
 
 impl Landscape {
@@ -41,44 +46,53 @@ impl Landscape {
     /// `points` object is intentionally consumed to free memory as soon as possible.
     /// In this case however it is moved and re-used as buffer for results.
     #[allow(dead_code)]
-    pub fn create(ph: Vec<PointHeight>) -> Self {
+    pub fn create(ph: Vec<f64>) -> Self {
         let mut points = Vec::with_capacity(ph.len());
         for h in &ph {
-            points.push(Point1D::with_height(*h));
+            points.push(Point::with_height((*h).into()));
         }
         let mut points_idx = Vec::from_iter((0..ph.len()).into_iter());
         points_idx.sort_unstable_by(|i, j| ph[*j].partial_cmp(&ph[*i]).unwrap());
-        Landscape { points, points_idx, results:ph }
+        Landscape { points, points_idx, results:ph, precision:VISCOSITY_COEF }
+    }
+
+    /// Create Landscape object.
+    /// `points` object is intentionally consumed to free memory as soon as possible.
+    /// `precision` precision in which to perform simulation, the less the worse performance.
+    /// Warning: setting precision equal to zero may cause simulation hang.
+    #[allow(dead_code)]
+    pub fn create_with_precision(ph: Vec<f64>, precision: PointHeight) -> Self {
+        let mut landscape = Self::create(ph);
+        landscape.precision = precision;
+        landscape
     }
 
     // TODO: This could be implemented as different specializations for different points passed as template parameter
     /// Determines directions in which water can flow from point at `idx` index.
     fn neighbors(&self, idx: usize) -> impl Iterator<Item=usize> {
-        Point1DIter {idx, max:self.points.len(), iter:0}
+        Iter1D {idx, max:self.points.len(), iter:0}
     }
 
     /// Function that determines how water is flowing thru landscape.
     /// Please look at `README.md` for more information.
     fn stabilize_water(&mut self) -> Result<()> {
         #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
-        let (state_lbound, mut state, mut diag) = (self.calc_state_lbound(), self.calc_state(), Vec::new());
+        let (state_lbound, mut state) = (self.calc_state_lbound(), self.calc_state());
 
         let mut send_water_to = Vec::new(); // TODO: possibly use smallvec or tiny_vec
+        let mut water_update = Vec::new();
         loop {
-            #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
-            diag.clear();
-            
-            let mut idle = true;
+            water_update.clear();
             for pi in &self.points_idx {
                 let pw = self.points[*pi].water;
-                if pw <= VISCOSITY_COEF {
+                if pw <= self.precision {
                     continue;
                 }
                 send_water_to.clear(); 
                 let ph = self.points[*pi].get_height();
                 for ni in self.neighbors(*pi) {
                     let nh = self.points[ni].get_height();
-                    if ph > nh + VISCOSITY_COEF {
+                    if ph > nh + self.precision {
                         send_water_to.push(ni);
                     }
                 }
@@ -88,46 +102,47 @@ impl Landscape {
                 let equal_fraction = pw / send_water_to.len() as PointHeight;
                 for ni in &send_water_to {
                     let diff = self.points[*pi].get_height() - self.points[*ni].get_height();
-                    if diff > VISCOSITY_COEF {
+                    if diff > self.precision {
                         let flow_amt = if equal_fraction < diff / 2.0 { equal_fraction } else { diff / 2.0 };
-                        
-                        #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
-                        diag.push(
-                            DiagWaterUpdate1D {
-                                from: self.points[*pi].clone(),
+                        water_update.push(
+                            WaterUpdate {
                                 from_idx: *pi,
-                                to: self.points[*ni].clone(),
                                 to_idx: *ni,
                                 water: flow_amt,
+                                
+                                #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
+                                from: self.points[*pi].clone(),
+                                #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))]
+                                to: self.points[*ni].clone(),
                             }
                         );
-
-                        self.points[*pi].water -= flow_amt;
-                        self.points[*ni].water += flow_amt;
-                        idle = false;
                     }
                 }
             }
-            if idle {
+            if water_update.is_empty() {
                 break;
+            }
+            for wu in &mut water_update {
+                self.points[wu.from_idx].water -= wu.water;
+                self.points[wu.to_idx].water += wu.water;
             }
             
             #[cfg(any(feature = "state_fun_f64", feature = "state_fun_bd"))] {
             let new_state = self.calc_state();
                 if state < state_lbound {
-                    dbg!(&diag);
+                    dbg!(&water_update);
                     bail!("State function check failed: state ({}) < low bound ({})", state, state_lbound);
                 }
                 if new_state < state_lbound {
-                    dbg!(&diag);
+                    dbg!(&water_update);
                     bail!("State function check failed: new_state ({}) < low bound ({})", new_state, state_lbound);
                 }
                 if new_state > state {
-                    dbg!(&diag);
+                    dbg!(&water_update);
                     bail!("State function check failed: new_state ({}) > prev_state ({})", new_state, state);
                 }
                 if new_state == state {
-                    dbg!(&diag);
+                    dbg!(&water_update);
                     bail!("State function check failed: new_state ({}) == prev_state ({}); Function should return before", new_state, state);
                 }
                 // dbg!(&state_lbound, &new_state, &state);
@@ -180,6 +195,9 @@ impl Landscape {
 }
 
 impl crate::Solver for Landscape {
+    /// Base unclehood type used for calculations during simulation in this module.
+    type PointHeight = f64; 
+    
     /// Simulates one step of falling rain.
     fn rain(&mut self, rain_distr: impl Fn(usize) -> PointHeight, return_result: bool) -> Result<&[PointHeight]> {
         for (idx, p) in self.points.iter_mut().enumerate() {
@@ -197,20 +215,23 @@ impl crate::Solver for Landscape {
             Ok(&[])
         }
     }
+    
+    /// Returns simulation precision.
+    fn precision(&self) -> PointHeight { self.precision }
 }
 
 /// Represents point (section) on landscape
 #[derive(Debug, Clone)]
-struct Point1D {
+struct Point {
     ground: PointHeight,
     water: PointHeight,
 }
 
-impl Point1D {
+impl Point {
     /// Point constructor
     #[allow(dead_code)]
     fn with_height(h: PointHeight) -> Self {
-        Point1D { 
+        Point { 
             ground: h,
             water: 0.0,
         }
@@ -229,13 +250,13 @@ impl Point1D {
     }
 }
 
-struct Point1DIter {
+struct Iter1D {
     idx: usize,
     max: usize,
     iter: u8,
 }
 
-impl Iterator for Point1DIter {
+impl Iterator for Iter1D {
     type Item = usize;
     fn next(&mut self) -> Option<Self::Item> {
         match self.iter {
@@ -257,7 +278,6 @@ impl Iterator for Point1DIter {
 #[derive(Debug, Clone)]
 struct PointFreehand {
     ground: PointHeight,
-    water: PointHeight,
     neighbors: Vec<usize>,
 }
 
@@ -265,24 +285,26 @@ impl PointFreehand {
     fn with_height(h: PointHeight) -> Self {
         PointFreehand { 
             ground: h,
-            water: 0.0,
             neighbors: Vec::with_capacity(2) 
         }
-    }
-
-    #[inline]
-    fn get_height(&self) -> PointHeight {
-        self.ground + self.water
     }
     
     #[inline]
     fn add_neighbor(&mut self, other: usize) {
         self.neighbors.push(other);
     }
-    
-    #[inline]
-    fn rain(&mut self, cnt: PointHeight) {
-        self.water += cnt;
-    }
 }
 */
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+/// Tests
+/// 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::*;
+    const STRICT_EQUALITY:bool = false;
+
+    include!("test_common_f64.inc.rs");
+}
